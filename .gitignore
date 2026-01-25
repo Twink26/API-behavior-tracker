@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Environment variables
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+QUICKSTART.md
+ARCHITECTURE.md
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+*.log
+
+# Kubernetes secrets (never commit!)
+k8s/secret.yaml.local
+
+# Database
+*.db
+*.sqlite
