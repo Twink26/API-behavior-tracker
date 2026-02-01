@@ -15,6 +15,13 @@ A production-inspired monitoring system that tracks and analyzes backend API usa
 - **Kubernetes Ready**: Complete K8s manifests for deployment
 - **Docker Containerized**: Production-ready Docker configuration
 
+### Recent updates
+- **Python 3.12+**: Replaced deprecated `datetime.utcnow()` with `datetime.now(timezone.utc)`; timestamps stored as timezone-aware.
+- **K8s startup**: Lazy DB init on first request so the app can start before PostgreSQL is ready.
+- **API safety**: Analytics `limit` and `hours` query params are capped (e.g. limit ≤ 1000, hours ≤ 720).
+- **CloudWatch**: Sequence-token handling for `put_log_events` when using existing log streams.
+- **Dependencies**: Pinned with minimum versions (e.g. `Flask>=3.0.0,<4`) for security updates.
+
 ## Architecture
 
 ```

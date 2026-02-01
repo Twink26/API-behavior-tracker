@@ -7,7 +7,7 @@ and provides analytics endpoints.
 import os
 import time
 import logging
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
@@ -48,7 +48,38 @@ try:
             if e.response['Error']['Code'] != 'ResourceAlreadyExistsException':
                 raise
 except Exception as e:
-    print(f"CloudWatch initialization warning: {e}")
+    print("CloudWatch initialization warning: %s", e)
+
+# In-memory sequence token for CloudWatch (used if API returns InvalidSequenceTokenException)
+_cloudwatch_sequence_token = None
+
+
+def _put_cloudwatch_log(method, endpoint, status_code, latency_ms):
+    """Send a single log event to CloudWatch; handles sequence token for older APIs."""
+    global _cloudwatch_sequence_token
+    payload = {
+        "logGroupName": log_group_name,
+        "logStreamName": log_stream_name,
+        "logEvents": [{
+            "timestamp": int(time.time() * 1000),
+            "message": f"{method} {endpoint} - {status_code} - {latency_ms:.2f}ms"
+        }]
+    }
+    if _cloudwatch_sequence_token:
+        payload["sequenceToken"] = _cloudwatch_sequence_token
+    try:
+        resp = cloudwatch_logs.put_log_events(**payload)
+        _cloudwatch_sequence_token = resp.get("nextSequenceToken")
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "InvalidSequenceTokenException":
+            token = e.response.get("Error", {}).get("expectedSequenceToken")
+            if token:
+                _cloudwatch_sequence_token = token
+                payload["sequenceToken"] = token
+                resp = cloudwatch_logs.put_log_events(**payload)
+                _cloudwatch_sequence_token = resp.get("nextSequenceToken")
+                return
+        raise
 
 # Configure logging
 logging.basicConfig(
@@ -68,7 +99,7 @@ class APIRequest(db.Model):
     method = db.Column(db.String(10), nullable=False, index=True)
     status_code = db.Column(db.Integer, nullable=False, index=True)
     latency_ms = db.Column(db.Float, nullable=False)
-    timestamp = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, index=True)
+    timestamp = db.Column(db.DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc), index=True)
     ip_address = db.Column(db.String(45))
     user_agent = db.Column(db.String(500))
     
@@ -85,11 +116,24 @@ class APIRequest(db.Model):
         }
 
 
+# Lazy DB init flag (avoids startup failure when DB not ready in K8s)
+_db_initialized = False
+
+
 # Middleware to log all requests
 @app.before_request
 def log_request():
     """Log every incoming request"""
+    global _db_initialized
     request.start_time = time.time()
+    # Lazy DB init on first request (K8s-friendly: app can start before Postgres is ready)
+    if not _db_initialized:
+        try:
+            db.create_all()
+            _db_initialized = True
+            logger.info("Database tables initialized")
+        except Exception as e:
+            logger.debug("Database not ready yet: %s", e)
 
 
 @app.after_request
@@ -108,16 +152,9 @@ def log_response(response):
     # Log to CloudWatch if available
     if cloudwatch_logs:
         try:
-            cloudwatch_logs.put_log_events(
-                logGroupName=log_group_name,
-                logStreamName=log_stream_name,
-                logEvents=[{
-                    'timestamp': int(time.time() * 1000),
-                    'message': f"{method} {endpoint} - {status_code} - {latency_ms:.2f}ms"
-                }]
-            )
+            _put_cloudwatch_log(method, endpoint, status_code, latency_ms)
         except Exception as e:
-            logger.warning(f"Failed to log to CloudWatch: {e}")
+            logger.warning("Failed to log to CloudWatch: %s", e)
     
     # Store in database (async in production, sync for simplicity)
     try:
@@ -132,7 +169,7 @@ def log_response(response):
         db.session.add(api_request)
         db.session.commit()
     except Exception as e:
-        logger.error(f"Failed to log request to database: {e}")
+        logger.error("Failed to log request to database: %s", e)
         db.session.rollback()
     
     return response
@@ -144,21 +181,26 @@ def health_check():
     """Health check endpoint"""
     return jsonify({
         'status': 'healthy',
-        'timestamp': datetime.utcnow().isoformat()
+        'timestamp': datetime.now(timezone.utc).isoformat()
     }), 200
 
 
 # Analytics Endpoints
+def _parse_hours(default=24, max_hours=720):
+    """Parse and clamp hours query param (max 30 days)."""
+    hours = request.args.get('hours', default, type=int)
+    return max(1, min(hours, max_hours))
+
 
 @app.route('/api/analytics/most-used', methods=['GET'])
 def get_most_used_endpoints():
     """Get most frequently used endpoints"""
-    limit = request.args.get('limit', 10, type=int)
-    hours = request.args.get('hours', 24, type=int)
+    limit = min(request.args.get('limit', 10, type=int), 1000)
+    limit = max(1, limit)
+    hours = _parse_hours()
     
     # Calculate time threshold
-    from datetime import timedelta
-    time_threshold = datetime.utcnow() - timedelta(hours=hours)
+    time_threshold = datetime.now(timezone.utc) - timedelta(hours=hours)
     
     results = db.session.query(
         APIRequest.endpoint,
@@ -189,10 +231,9 @@ def get_most_used_endpoints():
 @app.route('/api/analytics/error-rates', methods=['GET'])
 def get_error_rates():
     """Get error rates by endpoint"""
-    hours = request.args.get('hours', 24, type=int)
+    hours = _parse_hours()
     
-    from datetime import timedelta
-    time_threshold = datetime.utcnow() - timedelta(hours=hours)
+    time_threshold = datetime.now(timezone.utc) - timedelta(hours=hours)
     
     # Get total requests and error requests per endpoint
     total_requests = db.session.query(
@@ -254,10 +295,9 @@ def get_error_rates():
 @app.route('/api/analytics/response-times', methods=['GET'])
 def get_average_response_times():
     """Get average response times by endpoint"""
-    hours = request.args.get('hours', 24, type=int)
+    hours = _parse_hours()
     
-    from datetime import timedelta
-    time_threshold = datetime.utcnow() - timedelta(hours=hours)
+    time_threshold = datetime.now(timezone.utc) - timedelta(hours=hours)
     
     results = db.session.query(
         APIRequest.endpoint,
@@ -294,10 +334,9 @@ def get_average_response_times():
 @app.route('/api/analytics/summary', methods=['GET'])
 def get_summary():
     """Get overall summary statistics"""
-    hours = request.args.get('hours', 24, type=int)
+    hours = _parse_hours()
     
-    from datetime import timedelta
-    time_threshold = datetime.utcnow() - timedelta(hours=hours)
+    time_threshold = datetime.now(timezone.utc) - timedelta(hours=hours)
     
     # Total requests
     total_requests = db.session.query(func.count(APIRequest.id)).filter(
@@ -335,11 +374,11 @@ def get_summary():
 @app.route('/api/requests', methods=['GET'])
 def get_recent_requests():
     """Get recent API requests"""
-    limit = request.args.get('limit', 100, type=int)
-    hours = request.args.get('hours', 1, type=int)
+    limit = min(request.args.get('limit', 100, type=int), 1000)
+    limit = max(1, limit)
+    hours = _parse_hours(default=1)
     
-    from datetime import timedelta
-    time_threshold = datetime.utcnow() - timedelta(hours=hours)
+    time_threshold = datetime.now(timezone.utc) - timedelta(hours=hours)
     
     requests = APIRequest.query.filter(
         APIRequest.timestamp >= time_threshold
@@ -351,15 +390,6 @@ def get_recent_requests():
         'count': len(requests),
         'requests': [r.to_dict() for r in requests]
     }), 200
-
-
-# Initialize database tables on app startup
-with app.app_context():
-    try:
-        db.create_all()
-        logger.info("Database tables initialized")
-    except Exception as e:
-        logger.warning(f"Database initialization warning: {e}")
 
 
 if __name__ == '__main__':
