@@ -8,7 +8,7 @@ import os
 import time
 import logging
 from datetime import datetime, timezone, timedelta
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import func, desc
@@ -22,7 +22,7 @@ CORS(app)
 # Database configuration
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv(
     'DATABASE_URL',
-    'postgresql://api_tracker:password@localhost:5432/api_tracker'
+    'postgresql+psycopg2://api_tracker:password@localhost:5432/api_tracker'
 )
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
@@ -120,6 +120,15 @@ class APIRequest(db.Model):
 _db_initialized = False
 
 
+def _should_skip_logging(path):
+    """Do not log the dashboard or analytics APIs (they would pollute metrics)."""
+    if path == '/dashboard':
+        return True
+    if path.startswith('/api/analytics'):
+        return True
+    return False
+
+
 # Middleware to log all requests
 @app.before_request
 def log_request():
@@ -139,8 +148,12 @@ def log_request():
 @app.after_request
 def log_response(response):
     """Log response and store in database"""
+    if _should_skip_logging(request.path):
+        return response
+
     # Calculate latency
-    latency_ms = (time.time() - request.start_time) * 1000
+    start = getattr(request, 'start_time', time.time())
+    latency_ms = (time.time() - start) * 1000
     
     # Extract request details
     endpoint = request.path
@@ -173,6 +186,12 @@ def log_response(response):
         db.session.rollback()
     
     return response
+
+
+@app.route('/dashboard', methods=['GET'])
+def dashboard():
+    """Serve the analytics dashboard HTML page."""
+    return render_template('dashboard.html')
 
 
 # Health check endpoint

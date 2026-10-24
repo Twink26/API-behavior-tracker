@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>API Behavior Tracker</title>
+  <!-- Chart.js from CDN (no extra Python packages) -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, Segoe UI, Arial, sans-serif;
+      background: #f5f5f5;
+      color: #222;
+    }
+    header {
+      background: #fff;
+      border-bottom: 1px solid #ddd;
+      padding: 16px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    h1 { font-size: 1.25rem; margin: 0; }
+    label { font-size: 0.9rem; }
+    select { padding: 6px 10px; font-size: 0.95rem; }
+    main { max-width: 1100px; margin: 0 auto; padding: 20px; }
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+    .card, .panel {
+      background: #fff;
+      border: 1px solid #e5e5e5;
+      border-radius: 8px;
+      padding: 16px;
+    }
+    .card .label { color: #666; font-size: 0.85rem; }
+    .card .value { font-size: 1.6rem; font-weight: 600; margin-top: 6px; }
+    .panel { margin-bottom: 20px; }
+    .panel h2 { font-size: 1rem; margin: 0 0 12px; }
+    .empty, .error { color: #666; padding: 24px 0; text-align: center; }
+    .error { color: #b00020; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+    th, td { text-align: left; padding: 8px; border-bottom: 1px solid #eee; }
+    th { color: #555; font-weight: 600; }
+    tr.high-error { background: #fdecea; color: #8a1c14; }
+    canvas { max-height: 280px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>API Behavior Tracker</h1>
+    <label>
+      Time range
+      <!-- hours=1, 24, 168 matches the analytics API -->
+      <select id="hours" onchange="loadDashboard()">
+        <option value="1">Last 1 hour</option>
+        <option value="24" selected>Last 24 hours</option>
+        <option value="168">Last 7 days</option>
+      </select>
+    </label>
+  </header>
+
+  <main>
+    <div class="cards">
+      <div class="card"><div class="label">Total requests</div><div class="value" id="totalRequests">—</div></div>
+      <div class="card"><div class="label">Error rate</div><div class="value" id="errorRate">—</div></div>
+      <div class="card"><div class="label">Avg latency</div><div class="value" id="avgLatency">—</div></div>
+      <div class="card"><div class="label">Unique endpoints</div><div class="value" id="uniqueEndpoints">—</div></div>
+    </div>
+
+    <div class="panel">
+      <h2>Most used endpoints</h2>
+      <div id="mostUsedEmpty" class="empty" hidden>No data yet</div>
+      <canvas id="mostUsedChart"></canvas>
+    </div>
+
+    <div class="panel">
+      <h2>Error rates by endpoint</h2>
+      <div id="errorTableEmpty" class="empty" hidden>No data yet</div>
+      <div id="errorTableWrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Method</th>
+              <th>Endpoint</th>
+              <th>Total</th>
+              <th>Errors</th>
+              <th>Error rate</th>
+            </tr>
+          </thead>
+          <tbody id="errorTableBody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Average response time</h2>
+      <div id="latencyEmpty" class="empty" hidden>No data yet</div>
+      <canvas id="latencyChart"></canvas>
+    </div>
+  </main>
+
+  <script>
+    // Keep chart instances so we can replace them when the time range changes
+    let mostUsedChart = null;
+    let latencyChart = null;
+
+    function hours() {
+      return document.getElementById('hours').value;
+    }
+
+    // Fetch JSON from an existing analytics endpoint
+    async function getJson(path) {
+      const res = await fetch(path);
+      if (!res.ok) throw new Error(path + ' failed (' + res.status + ')');
+      return res.json();
+    }
+
+    function setText(id, text) {
+      document.getElementById(id).textContent = text;
+    }
+
+    function showEmpty(emptyId, chartOrWrap, isEmpty) {
+      document.getElementById(emptyId).hidden = !isEmpty;
+      if (chartOrWrap) chartOrWrap.hidden = isEmpty;
+    }
+
+    function destroyChart(chart) {
+      if (chart) chart.destroy();
+    }
+
+    function barChart(canvasId, labels, data, label) {
+      return new Chart(document.getElementById(canvasId), {
+        type: 'bar',
+        data: {
+          labels: labels,
+          datasets: [{ label: label, data: data, backgroundColor: '#4a90d9' }]
+        },
+        options: {
+          responsive: true,
+          plugins: { legend: { display: false } },
+          scales: { y: { beginAtZero: true } }
+        }
+      });
+    }
+
+    async function loadDashboard() {
+      const h = hours();
+
+      // 1) Summary cards — fields from GET /api/analytics/summary
+      try {
+        const data = await getJson('/api/analytics/summary?hours=' + h);
+        const s = data.summary || {};
+        const total = s.total_requests || 0;
+        setText('totalRequests', total);
+        setText('errorRate', (s.error_rate_percent != null ? s.error_rate_percent : 0) + '%');
+        setText('avgLatency', (s.avg_latency_ms != null ? s.avg_latency_ms : 0) + ' ms');
+        setText('uniqueEndpoints', s.unique_endpoints || 0);
+        if (total === 0) {
+          setText('totalRequests', '0');
+        }
+      } catch (err) {
+        setText('totalRequests', 'Error');
+        setText('errorRate', 'Error');
+        setText('avgLatency', 'Error');
+        setText('uniqueEndpoints', 'Error');
+      }
+
+      // 2) Most used bar chart — request_count, method, endpoint
+      try {
+        const data = await getJson('/api/analytics/most-used?limit=10&hours=' + h);
+        const rows = data.results || [];
+        const canvas = document.getElementById('mostUsedChart');
+        showEmpty('mostUsedEmpty', canvas, rows.length === 0);
+        destroyChart(mostUsedChart);
+        mostUsedChart = null;
+        if (rows.length) {
+          const labels = rows.map(r => r.method + ' ' + r.endpoint);
+          const counts = rows.map(r => r.request_count);
+          mostUsedChart = barChart('mostUsedChart', labels, counts, 'Requests');
+        }
+      } catch (err) {
+        document.getElementById('mostUsedEmpty').textContent = 'Could not load most-used data';
+        showEmpty('mostUsedEmpty', document.getElementById('mostUsedChart'), true);
+      }
+
+      // 3) Error-rate table — highlight error_rate_percent > 5
+      try {
+        const data = await getJson('/api/analytics/error-rates?hours=' + h);
+        const rows = data.results || [];
+        const wrap = document.getElementById('errorTableWrap');
+        const body = document.getElementById('errorTableBody');
+        body.innerHTML = '';
+        showEmpty('errorTableEmpty', wrap, rows.length === 0);
+        rows.forEach(function (r) {
+          const tr = document.createElement('tr');
+          if ((r.error_rate_percent || 0) > 5) tr.className = 'high-error';
+          tr.innerHTML =
+            '<td>' + r.method + '</td>' +
+            '<td>' + r.endpoint + '</td>' +
+            '<td>' + r.total_requests + '</td>' +
+            '<td>' + r.error_count + '</td>' +
+            '<td>' + r.error_rate_percent + '%</td>';
+          body.appendChild(tr);
+        });
+      } catch (err) {
+        document.getElementById('errorTableEmpty').textContent = 'Could not load error rates';
+        showEmpty('errorTableEmpty', document.getElementById('errorTableWrap'), true);
+      }
+
+      // 4) Average latency bar chart — avg_latency_ms
+      try {
+        const data = await getJson('/api/analytics/response-times?hours=' + h);
+        const rows = data.results || [];
+        const canvas = document.getElementById('latencyChart');
+        showEmpty('latencyEmpty', canvas, rows.length === 0);
+        destroyChart(latencyChart);
+        latencyChart = null;
+        if (rows.length) {
+          const labels = rows.map(r => r.method + ' ' + r.endpoint);
+          const values = rows.map(r => r.avg_latency_ms);
+          latencyChart = barChart('latencyChart', labels, values, 'Avg ms');
+        }
+      } catch (err) {
+        document.getElementById('latencyEmpty').textContent = 'Could not load response times';
+        showEmpty('latencyEmpty', document.getElementById('latencyChart'), true);
+      }
+    }
+
+    loadDashboard();
+  </script>
+</body>
+</html>

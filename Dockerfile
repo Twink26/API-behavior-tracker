@@ -1,5 +1,5 @@
 # Multi-stage build for production-ready Docker image
-FROM python:3.11-slim as builder
+FROM python:3.11-slim AS builder
 
 WORKDIR /app
 
@@ -15,8 +15,9 @@ WORKDIR /app
 # Copy installed packages from builder
 COPY --from=builder /root/.local /root/.local
 
-# Copy application code
+# Copy application code and HTML templates
 COPY app.py .
+COPY templates ./templates
 
 # Make sure scripts in .local are usable
 ENV PATH=/root/.local/bin:$PATH
