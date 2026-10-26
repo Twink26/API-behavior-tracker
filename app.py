@@ -19,6 +19,14 @@ from botocore.exceptions import ClientError
 app = Flask(__name__)
 CORS(app)
 
+# Do not write these to the request log (edit this list as needed).
+# '/api/analytics' also skips everything under /api/analytics/.
+SKIP_LOG_PATHS = [
+    '/health',
+    '/dashboard',
+    '/api/analytics',
+]
+
 # Database configuration
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv(
     'DATABASE_URL',
@@ -121,11 +129,10 @@ _db_initialized = False
 
 
 def _should_skip_logging(path):
-    """Do not log the dashboard or analytics APIs (they would pollute metrics)."""
-    if path == '/dashboard':
-        return True
-    if path.startswith('/api/analytics'):
-        return True
+    """True if this path is in SKIP_LOG_PATHS (exact or prefix)."""
+    for skipped in SKIP_LOG_PATHS:
+        if path == skipped or path.startswith(skipped + '/'):
+            return True
     return False
 
 
@@ -156,7 +163,8 @@ def log_response(response):
     latency_ms = (time.time() - start) * 1000
     
     # Extract request details
-    endpoint = request.path
+    # Save the route template (/users/<id>), not /users/1; unknown routes → "unmatched"
+    endpoint = request.url_rule.rule if request.url_rule else 'unmatched'
     method = request.method
     status_code = response.status_code
     ip_address = request.remote_addr
