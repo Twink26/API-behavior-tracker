@@ -319,42 +319,114 @@ def get_error_rates():
     }), 200
 
 
+def _round2(value):
+    """Round a numeric value to 2 decimals; None → 0.0."""
+    return round(float(value), 2) if value is not None else 0.0
+
+
+def _pg_percentile(fraction):
+    """PostgreSQL percentile_cont(fraction) WITHIN GROUP (ORDER BY latency_ms)."""
+    return func.percentile_cont(fraction).within_group(APIRequest.latency_ms)
+
+
+def _python_percentile(values, fraction):
+    """Linear interpolation (same idea as percentile_cont) for SQLite tests."""
+    if not values:
+        return 0.0
+    xs = sorted(values)
+    if len(xs) == 1:
+        return _round2(xs[0])
+    k = (len(xs) - 1) * fraction
+    lo = int(k)
+    hi = min(lo + 1, len(xs) - 1)
+    if lo == hi:
+        return _round2(xs[lo])
+    return _round2(xs[lo] * (hi - k) + xs[hi] * (k - lo))
+
+
+def _is_postgres():
+    return db.engine.dialect.name == 'postgresql'
+
+
 @app.route('/api/analytics/response-times', methods=['GET'])
 def get_average_response_times():
     """Get average response times by endpoint"""
     hours = _parse_hours()
     
     time_threshold = datetime.now(timezone.utc) - timedelta(hours=hours)
+    time_filter = APIRequest.timestamp >= time_threshold
     
-    results = db.session.query(
-        APIRequest.endpoint,
-        APIRequest.method,
-        func.avg(APIRequest.latency_ms).label('avg_latency'),
-        func.min(APIRequest.latency_ms).label('min_latency'),
-        func.max(APIRequest.latency_ms).label('max_latency'),
-        func.count(APIRequest.id).label('request_count')
-    ).filter(
-        APIRequest.timestamp >= time_threshold
-    ).group_by(
-        APIRequest.endpoint,
-        APIRequest.method
-    ).order_by(
-        desc('avg_latency')
-    ).all()
-    
-    return jsonify({
-        'timeframe_hours': hours,
-        'results': [
+    if _is_postgres():
+        results = db.session.query(
+            APIRequest.endpoint,
+            APIRequest.method,
+            func.avg(APIRequest.latency_ms).label('avg_latency'),
+            func.min(APIRequest.latency_ms).label('min_latency'),
+            func.max(APIRequest.latency_ms).label('max_latency'),
+            func.count(APIRequest.id).label('request_count'),
+            _pg_percentile(0.5).label('p50_latency'),
+            _pg_percentile(0.95).label('p95_latency'),
+        ).filter(
+            time_filter
+        ).group_by(
+            APIRequest.endpoint,
+            APIRequest.method
+        ).order_by(
+            desc('avg_latency')
+        ).all()
+        rows = [
             {
                 'endpoint': r.endpoint,
                 'method': r.method,
-                'avg_latency_ms': round(float(r.avg_latency), 2),
-                'min_latency_ms': round(float(r.min_latency), 2),
-                'max_latency_ms': round(float(r.max_latency), 2),
-                'request_count': r.request_count
+                'avg_latency_ms': _round2(r.avg_latency),
+                'min_latency_ms': _round2(r.min_latency),
+                'max_latency_ms': _round2(r.max_latency),
+                'request_count': r.request_count,
+                'p50_latency': _round2(r.p50_latency),
+                'p95_latency': _round2(r.p95_latency),
             }
             for r in results
         ]
+    else:
+        # SQLite has no percentile_cont — reuse avg/min/max SQL, percentiles in Python
+        results = db.session.query(
+            APIRequest.endpoint,
+            APIRequest.method,
+            func.avg(APIRequest.latency_ms).label('avg_latency'),
+            func.min(APIRequest.latency_ms).label('min_latency'),
+            func.max(APIRequest.latency_ms).label('max_latency'),
+            func.count(APIRequest.id).label('request_count')
+        ).filter(
+            time_filter
+        ).group_by(
+            APIRequest.endpoint,
+            APIRequest.method
+        ).order_by(
+            desc('avg_latency')
+        ).all()
+        latencies = db.session.query(
+            APIRequest.endpoint, APIRequest.method, APIRequest.latency_ms
+        ).filter(time_filter).all()
+        by_key = {}
+        for endpoint, method, latency in latencies:
+            by_key.setdefault((endpoint, method), []).append(latency)
+        rows = [
+            {
+                'endpoint': r.endpoint,
+                'method': r.method,
+                'avg_latency_ms': _round2(r.avg_latency),
+                'min_latency_ms': _round2(r.min_latency),
+                'max_latency_ms': _round2(r.max_latency),
+                'request_count': r.request_count,
+                'p50_latency': _python_percentile(by_key.get((r.endpoint, r.method), []), 0.5),
+                'p95_latency': _python_percentile(by_key.get((r.endpoint, r.method), []), 0.95),
+            }
+            for r in results
+        ]
+    
+    return jsonify({
+        'timeframe_hours': hours,
+        'results': rows
     }), 200
 
 
@@ -386,6 +458,20 @@ def get_summary():
         APIRequest.timestamp >= time_threshold
     ).scalar()
     
+    # Overall p95 (Postgres percentile_cont; Python fallback on SQLite)
+    if _is_postgres():
+        p95_latency = db.session.query(
+            _pg_percentile(0.95)
+        ).filter(
+            APIRequest.timestamp >= time_threshold
+        ).scalar()
+        p95_latency = _round2(p95_latency)
+    else:
+        lats = [row[0] for row in db.session.query(APIRequest.latency_ms).filter(
+            APIRequest.timestamp >= time_threshold
+        ).all()]
+        p95_latency = _python_percentile(lats, 0.95)
+    
     return jsonify({
         'timeframe_hours': hours,
         'summary': {
@@ -393,7 +479,8 @@ def get_summary():
             'error_count': error_count or 0,
             'error_rate_percent': round((error_count or 0) * 100.0 / (total_requests or 1), 2),
             'avg_latency_ms': round(float(avg_latency or 0), 2),
-            'unique_endpoints': unique_endpoints or 0
+            'unique_endpoints': unique_endpoints or 0,
+            'p95_latency': p95_latency
         }
     }), 200
 

@@ -72,6 +72,7 @@
       <div class="card"><div class="label">Total requests</div><div class="value" id="totalRequests">—</div></div>
       <div class="card"><div class="label">Error rate</div><div class="value" id="errorRate">—</div></div>
       <div class="card"><div class="label">Avg latency</div><div class="value" id="avgLatency">—</div></div>
+      <div class="card"><div class="label">p95 latency (ms)</div><div class="value" id="p95Latency">—</div></div>
       <div class="card"><div class="label">Unique endpoints</div><div class="value" id="uniqueEndpoints">—</div></div>
     </div>
 
@@ -101,7 +102,7 @@
     </div>
 
     <div class="panel">
-      <h2>Average response time</h2>
+      <h2>Response time (avg vs p95)</h2>
       <div id="latencyEmpty" class="empty" hidden>No data yet</div>
       <canvas id="latencyChart"></canvas>
     </div>
@@ -162,6 +163,7 @@
         setText('totalRequests', total);
         setText('errorRate', (s.error_rate_percent != null ? s.error_rate_percent : 0) + '%');
         setText('avgLatency', (s.avg_latency_ms != null ? s.avg_latency_ms : 0) + ' ms');
+        setText('p95Latency', (s.p95_latency != null ? s.p95_latency : 0) + ' ms');
         setText('uniqueEndpoints', s.unique_endpoints || 0);
         if (total === 0) {
           setText('totalRequests', '0');
@@ -170,6 +172,7 @@
         setText('totalRequests', 'Error');
         setText('errorRate', 'Error');
         setText('avgLatency', 'Error');
+        setText('p95Latency', 'Error');
         setText('uniqueEndpoints', 'Error');
       }
 
@@ -215,7 +218,7 @@
         showEmpty('errorTableEmpty', document.getElementById('errorTableWrap'), true);
       }
 
-      // 4) Average latency bar chart — avg_latency_ms
+      // 4) Latency chart — avg_latency_ms and p95_latency as grouped bars
       try {
         const data = await getJson('/api/analytics/response-times?hours=' + h);
         const rows = data.results || [];
@@ -225,8 +228,21 @@
         latencyChart = null;
         if (rows.length) {
           const labels = rows.map(r => r.method + ' ' + r.endpoint);
-          const values = rows.map(r => r.avg_latency_ms);
-          latencyChart = barChart('latencyChart', labels, values, 'Avg ms');
+          latencyChart = new Chart(canvas, {
+            type: 'bar',
+            data: {
+              labels: labels,
+              datasets: [
+                { label: 'Avg ms', data: rows.map(r => r.avg_latency_ms), backgroundColor: '#4a90d9' },
+                { label: 'p95 ms', data: rows.map(r => r.p95_latency), backgroundColor: '#e67e22' }
+              ]
+            },
+            options: {
+              responsive: true,
+              plugins: { legend: { display: true } },
+              scales: { y: { beginAtZero: true } }
+            }
+          });
         }
       } catch (err) {
         document.getElementById('latencyEmpty').textContent = 'Could not load response times';
