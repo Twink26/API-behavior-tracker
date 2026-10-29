@@ -77,6 +77,12 @@
     </div>
 
     <div class="panel">
+      <h2>Requests over time</h2>
+      <div id="timeseriesEmpty" class="empty" hidden>No data yet</div>
+      <canvas id="timeseriesChart"></canvas>
+    </div>
+
+    <div class="panel">
       <h2>Most used endpoints</h2>
       <div id="mostUsedEmpty" class="empty" hidden>No data yet</div>
       <canvas id="mostUsedChart"></canvas>
@@ -112,6 +118,7 @@
     // Keep chart instances so we can replace them when the time range changes
     let mostUsedChart = null;
     let latencyChart = null;
+    let timeseriesChart = null;
 
     function hours() {
       return document.getElementById('hours').value;
@@ -174,6 +181,37 @@
         setText('avgLatency', 'Error');
         setText('p95Latency', 'Error');
         setText('uniqueEndpoints', 'Error');
+      }
+
+      // 1b) Requests over time — bucket, total, errors
+      try {
+        const data = await getJson('/api/analytics/timeseries?hours=' + h);
+        const rows = data.results || [];
+        const hasData = rows.some(function (r) { return r.total > 0; });
+        const canvas = document.getElementById('timeseriesChart');
+        showEmpty('timeseriesEmpty', canvas, !hasData);
+        destroyChart(timeseriesChart);
+        timeseriesChart = null;
+        if (hasData) {
+          timeseriesChart = new Chart(canvas, {
+            type: 'line',
+            data: {
+              labels: rows.map(r => r.bucket),
+              datasets: [
+                { label: 'Total', data: rows.map(r => r.total), borderColor: '#4a90d9', backgroundColor: '#4a90d9', fill: false },
+                { label: 'Errors', data: rows.map(r => r.errors), borderColor: '#c0392b', backgroundColor: '#c0392b', fill: false }
+              ]
+            },
+            options: {
+              responsive: true,
+              plugins: { legend: { display: true } },
+              scales: { y: { beginAtZero: true } }
+            }
+          });
+        }
+      } catch (err) {
+        document.getElementById('timeseriesEmpty').textContent = 'Could not load timeseries';
+        showEmpty('timeseriesEmpty', document.getElementById('timeseriesChart'), true);
       }
 
       // 2) Most used bar chart — request_count, method, endpoint

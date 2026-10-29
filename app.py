@@ -11,7 +11,7 @@ from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import func, desc
+from sqlalchemy import func, desc, case, text
 import boto3
 from botocore.exceptions import ClientError
 
@@ -483,6 +483,91 @@ def get_summary():
             'p95_latency': p95_latency
         }
     }), 200
+
+
+def _aware_utc(dt):
+    """Normalize a datetime to timezone-aware UTC."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _align_bucket(dt, hours):
+    """Snap dt to hour (if hours > 24) or 5-minute (if hours <= 24)."""
+    dt = _aware_utc(dt).replace(second=0, microsecond=0)
+    if hours > 24:
+        return dt.replace(minute=0)
+    return dt.replace(minute=(dt.minute // 5) * 5)
+
+
+def _pg_bucket_column(hours):
+    """PostgreSQL bucket: date_trunc hour, or minute truncated down to 5 minutes."""
+    ts = APIRequest.timestamp
+    if hours > 24:
+        return func.date_trunc('hour', ts)
+    # date_trunc('minute') then subtract leftover minutes (0–4)
+    return func.date_trunc('minute', ts) - (
+        func.extract('minute', ts) % 5
+    ) * text("interval '1 minute'")
+
+
+@app.route('/api/analytics/timeseries', methods=['GET'])
+def get_timeseries():
+    """Request counts per time bucket (hourly or 5-minute)."""
+    hours = _parse_hours()
+    now = datetime.now(timezone.utc)
+    time_threshold = now - timedelta(hours=hours)
+
+    if _is_postgres():
+        bucket_col = _pg_bucket_column(hours)
+        grouped = db.session.query(
+            bucket_col.label('bucket'),
+            func.count(APIRequest.id).label('total'),
+            func.coalesce(
+                func.sum(case((APIRequest.status_code >= 400, 1), else_=0)),
+                0
+            ).label('errors')
+        ).filter(
+            APIRequest.timestamp >= time_threshold
+        ).group_by(
+            bucket_col
+        ).all()
+        counts = {
+            _align_bucket(row.bucket, hours): {'total': int(row.total), 'errors': int(row.errors)}
+            for row in grouped if row.bucket is not None
+        }
+    else:
+        # SQLite has no date_trunc — group in Python
+        raw = db.session.query(APIRequest.timestamp, APIRequest.status_code).filter(
+            APIRequest.timestamp >= time_threshold
+        ).all()
+        counts = {}
+        for ts, status in raw:
+            key = _align_bucket(ts, hours)
+            slot = counts.setdefault(key, {'total': 0, 'errors': 0})
+            slot['total'] += 1
+            if status >= 400:
+                slot['errors'] += 1
+
+    if not counts:
+        return jsonify({'timeframe_hours': hours, 'results': []}), 200
+
+    step = timedelta(hours=1) if hours > 24 else timedelta(minutes=5)
+    t = _align_bucket(time_threshold, hours)
+    end = _align_bucket(now, hours)
+    results = []
+    while t <= end:
+        slot = counts.get(t, {'total': 0, 'errors': 0})
+        results.append({
+            'bucket': t.isoformat(),
+            'total': slot['total'],
+            'errors': slot['errors'],
+        })
+        t += step
+
+    return jsonify({'timeframe_hours': hours, 'results': results}), 200
 
 
 @app.route('/api/requests', methods=['GET'])

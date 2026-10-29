@@ -1,5 +1,5 @@
 """Analytics API behaviour."""
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from app import app, db, APIRequest
 
@@ -81,3 +81,41 @@ def test_response_times_empty_database(client):
     assert times['results'] == []
     summary = client.get('/api/analytics/summary').get_json()['summary']
     assert summary['p95_latency'] == 0.0
+
+
+def test_timeseries_three_hours(client):
+    """Rows in 3 different hours should land in 3 buckets with correct totals/errors."""
+    now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    with app.app_context():
+        rows = [
+            (now - timedelta(hours=2), 200),
+            (now - timedelta(hours=2), 200),
+            (now - timedelta(hours=1), 500),
+            (now, 200),
+            (now, 404),
+        ]
+        for ts, status in rows:
+            db.session.add(APIRequest(
+                endpoint='/ts', method='GET', status_code=status,
+                latency_ms=10.0, timestamp=ts,
+            ))
+        db.session.commit()
+    data = client.get('/api/analytics/timeseries?hours=48').get_json()
+    nonzero = [r for r in data['results'] if r['total'] > 0]
+    assert len(nonzero) == 3
+    assert [r['total'] for r in nonzero] == [2, 1, 2]
+    assert [r['errors'] for r in nonzero] == [0, 1, 1]
+    assert any(r['total'] == 0 for r in data['results'])
+
+
+def test_timeseries_empty_database(client):
+    """Empty DB should return an empty list and not crash."""
+    data = client.get('/api/analytics/timeseries?hours=24').get_json()
+    assert data['results'] == []
+
+
+def test_timeseries_hours_is_capped(client):
+    """hours=99999 must be capped at 720."""
+    data = client.get('/api/analytics/timeseries?hours=99999').get_json()
+    assert data['timeframe_hours'] == 720
+
